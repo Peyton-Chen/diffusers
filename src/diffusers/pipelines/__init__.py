@@ -367,7 +367,7 @@ else:
         "TextToVideoZeroSDXLPipeline",
         "VideoToVideoSDPipeline",
     ]
-    _import_structure["step1x_edit"] = ["Step1XEditPipeline"]
+    _import_structure["step1x_edit"] = ["Step1XEditPipeline", "Step1XEditPipelineV1P2"]
     _import_structure["i2vgen_xl"] = ["I2VGenXLPipeline"]
     _import_structure["unclip"] = ["UnCLIPImageVariationPipeline", "UnCLIPPipeline"]
     _import_structure["unidiffuser"] = [
@@ -763,7 +763,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             StableDiffusionXLPipeline,
         )
         from .stable_video_diffusion import StableVideoDiffusionPipeline
-        from .step1x_edit import Step1XEditPipeline
+        from .step1x_edit import Step1XEditPipeline, Step1XEditPipelineV1P2
         from .t2i_adapter import (
             StableDiffusionAdapterPipeline,
             StableDiffusionXLAdapterPipeline,

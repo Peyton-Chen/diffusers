@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import PIL.Image
@@ -19,3 +19,5 @@ class Step1XEditPipelineOutput(BaseOutput):
     """
 
     images: Union[List[PIL.Image.Image], np.ndarray]
+    reformat_prompt: Optional[str] = None
+    think_info: Optional[List[str]] = None

@@ -934,6 +934,7 @@ class Step1XEditTransformer2DModel(
         connector_depth=2,
         guidance_embeds: bool = False,
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        enable_text_token_mapping: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -980,6 +981,11 @@ class Step1XEditTransformer2DModel(
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
+        if enable_text_token_mapping:
+            self.text_token_mapping = nn.Linear(3584, 4096)
+        else:
+            self.text_token_mapping = None
+
         self.gradient_checkpointing = False
 
     def forward(
@@ -994,6 +1000,8 @@ class Step1XEditTransformer2DModel(
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
         controlnet_blocks_repeat: bool = False,
+        text_embeddings: torch.Tensor | None = None,
+        text_mask: torch.Tensor | None = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`Step1XEditTransformer2DModel`] forward method.
@@ -1039,6 +1047,12 @@ class Step1XEditTransformer2DModel(
         encoder_hidden_states, y = self.connector(
             encoder_hidden_states, timestep, prompt_embeds_mask
         )
+
+        if self.text_token_mapping is not None:
+            text_hidden_states = self.text_token_mapping(text_embeddings)  # type: ignore
+            text_hidden_states = text_hidden_states * text_mask[:, :, None]
+            encoder_hidden_states = encoder_hidden_states + text_hidden_states
+
         hidden_states = self.x_embedder(hidden_states)
 
         temb = self.time_embed(self.time_proj(timestep * 1000).to(timestep))

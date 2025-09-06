@@ -59,6 +59,7 @@ parser.add_argument("--filename", default="flux.safetensors", type=str)
 parser.add_argument("--checkpoint_path", default=None, type=str)
 parser.add_argument("--in_channels", type=int, default=64)
 parser.add_argument("--out_channels", type=int, default=64)
+parser.add_argument("--enable_text_token_mapping", action="store_true")
 parser.add_argument("--vae", action="store_true")
 parser.add_argument("--text_encoder", action="store_true")
 parser.add_argument("--transformer", action="store_true")
@@ -90,7 +91,7 @@ def swap_scale_shift(weight):
 
 
 def convert_step1x_edit_transformer_checkpoint_to_diffusers(
-    original_state_dict, num_layers, num_single_layers, inner_dim, mlp_ratio=4.0
+    original_state_dict, num_layers, num_single_layers, inner_dim, mlp_ratio=4.0, enable_text_token_mapping=False,
 ):
     converted_state_dict = {}
 
@@ -282,7 +283,9 @@ def convert_step1x_edit_transformer_checkpoint_to_diffusers(
         original_state_dict.pop("final_layer.adaLN_modulation.1.bias")
     )
 
-    print(original_state_dict.keys())
+    if enable_text_token_mapping:
+        converted_state_dict["text_token_mapping.bias"] = original_state_dict.pop("text_token_mapping.bias")
+        converted_state_dict["text_token_mapping.weight"] = original_state_dict.pop("text_token_mapping.weight")
 
     return converted_state_dict
 
@@ -526,10 +529,10 @@ def main(args):
         mlp_ratio = 4.0
 
         converted_transformer_state_dict = convert_step1x_edit_transformer_checkpoint_to_diffusers(
-            original_ckpt, num_layers, num_single_layers, inner_dim, mlp_ratio=mlp_ratio
+            original_ckpt, num_layers, num_single_layers, inner_dim, mlp_ratio=mlp_ratio, enable_text_token_mapping=args.enable_text_token_mapping
         )
         transformer = Step1XEditTransformer2DModel(
-            in_channels=args.in_channels, out_channels=args.out_channels
+            in_channels=args.in_channels, out_channels=args.out_channels, enable_text_token_mapping=args.enable_text_token_mapping
         )
         transformer.load_state_dict(converted_transformer_state_dict, strict=True)
         transformer.to(dtype).save_pretrained(f"{args.output_path}/transformer")
