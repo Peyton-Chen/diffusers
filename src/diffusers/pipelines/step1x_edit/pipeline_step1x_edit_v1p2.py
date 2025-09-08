@@ -968,8 +968,8 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         timesteps_truncate: float = 0.93,
         process_norm_power: float = 0.4,
-        enable_thinking_mode: bool = True,
-        enable_reformat_prompt: bool = False,
+        enable_thinking_mode: bool = False,
+        enable_reflection_mode: bool = True,
         max_try_cnt: int = 3,
     ):
         r"""
@@ -1056,10 +1056,10 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         try_cnt = 0
         success = False
 
-        if enable_thinking_mode:
+        if enable_reflection_mode or enable_thinking_mode:
             thinker = Step1XEditThinker(self.text_encoder, self.processor)
-            if enable_reformat_prompt:
-                reformat_prompt = thinker.prompt_reformat(image, prompt)
+            if enable_thinking_mode:
+                reformat_prompt = thinker.think(image, prompt)
             else:
                 reformat_prompt = prompt
             prompt = reformat_prompt
@@ -1294,8 +1294,8 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 image = self.image_processor.postprocess(image, output_type=output_type)
                 image = self._output_process_image(image, img_info)
 
-            if enable_thinking_mode:
-                thinking_info = thinker(original_ref_image, image[0], original_prompt)
+            if enable_reflection_mode:
+                thinking_info = thinker.reflect(original_ref_image, image[0], original_prompt)
                 success, refine_prompt = thinker.format_text(thinking_info)
                 out_images.append(image[0])
                 out_think_info.append(thinking_info)
@@ -1312,8 +1312,8 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 break
         # Offload all models
         self.maybe_free_model_hooks()
-        if enable_thinking_mode:
-            if enable_reformat_prompt:
+        if enable_reflection_mode or enable_thinking_mode:
+            if enable_thinking_mode:
                 return Step1XEditPipelineOutput(images=out_images, reformat_prompt=reformat_prompt, think_info=out_think_info)
             else:
                 return Step1XEditPipelineOutput(images=out_images, think_info=out_think_info)
