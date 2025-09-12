@@ -501,7 +501,7 @@ class Step1XEditThinker:
     def __init__(self, model, processor):
         self.reflector = ImageEditEvaluator(model=model, processor=processor)
 
-    def __call__(
+    def reflect(
         self,
         source_image: Image.Image,
         result_image: Image.Image | None,
@@ -512,7 +512,7 @@ class Step1XEditThinker:
         )
         return res["reflection"]
 
-    def prompt_reformat(self, source_image: Image.Image, instruction: str):
+    def think(self, source_image: Image.Image, instruction: str):
         res = self.reflector.prompt_reformat(source_image=source_image, original_instruction=instruction)
         return res
 
