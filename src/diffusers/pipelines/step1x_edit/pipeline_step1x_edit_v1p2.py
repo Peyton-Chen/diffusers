@@ -1,3 +1,4 @@
+      
 # Copyright 2025 Step1X-Edit Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -657,6 +658,7 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         image: Optional[torch.Tensor],
         width: Optional[int] = None,
         height: Optional[int] = None,
+        size_level: int = 1024,
         device: Optional[torch.device] = None,
         num_images_per_prompt: int = 1,
     ):
@@ -667,10 +669,10 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
             aspect_ratio = width / height
 
             if width > height:
-                width_new = math.ceil(math.sqrt(1024 * 1024 * aspect_ratio))
+                width_new = math.ceil(math.sqrt(size_level * size_level * aspect_ratio))
                 height_new = math.ceil(width_new / aspect_ratio)
             else:
-                height_new = math.ceil(math.sqrt(1024 * 1024 / aspect_ratio))
+                height_new = math.ceil(math.sqrt(size_level * size_level / aspect_ratio))
                 width_new = math.ceil(height_new * aspect_ratio)
 
             multiple_of = self.vae_scale_factor * 2
@@ -687,10 +689,10 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
             image = torch.nn.functional.interpolate(image, (height, width), mode="bilinear", antialias=True)
             image = image * 2 - 1
         else:
-            width = width if width is not None else 1024
-            height = height if height is not None else 1024
+            width = width if width is not None else size_level
+            height = height if height is not None else size_level
             img_info = (width, height)
-            ref_image = torch.zeros(3, 1024, 1024).unsqueeze(0).to(device)
+            ref_image = torch.zeros(3, size_level, size_level).unsqueeze(0).to(device)
             ref_image = self.image_processor.pt_to_numpy(ref_image)
             ref_image = self.image_processor.numpy_to_pil(ref_image)[0]
             image = None
@@ -947,6 +949,7 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         true_cfg_scale: float = 6.0,
         height: Optional[int] = None,
         width: Optional[int] = None,
+        size_level: int = 1024,
         num_inference_steps: int = 28,
         sigmas: Optional[List[float]] = None,
         guidance_scale: float = 6.0,
@@ -1078,6 +1081,7 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 image,
                 width,
                 height,
+                size_level,
                 device,
                 num_images_per_prompt
             )
@@ -1322,3 +1326,5 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 return (image,)
 
             return Step1XEditPipelineOutput(images=out_images)
+
+    
