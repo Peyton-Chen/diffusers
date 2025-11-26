@@ -21,3 +21,5 @@ class Step1XEditPipelineOutput(BaseOutput):
     images: Union[List[PIL.Image.Image], np.ndarray]
     reformat_prompt: Optional[str] = None
     think_info: Optional[List[str]] = None
+    best_info: Optional[List[str]] = None
+    final_images: Union[List[PIL.Image.Image], np.ndarray] = None

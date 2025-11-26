@@ -497,9 +497,614 @@ class ImageEditEvaluator:
         return True, cleaned
 
 
+
+
+
+
+
+
+
+
+
+class ImageEditEvaluator_EN:
+
+    def __init__(self, model: Qwen2_5_VLForConditionalGeneration, processor: AutoProcessor):
+
+        self.client = QwenGenerativeAIClient(model, processor)
+
+    def prompt_reformat(self, source_image: Image.Image, original_instruction: str):
+        src_data_url = image_to_data_url(source_image)
+        messages = self.build_reformt_prompt(src_data_url, original_instruction)
+        resp_text = self.client.call_model(messages, max_tokens=512)
+
+        if resp_text.startswith("错误:"):
+            raise RuntimeError(f"API call failed: {resp_text}")
+
+        return resp_text.strip()
+
+    def run_full_pipeline(self, source_image, edited_image, original_instruction: str) -> dict[str, Any]:
+        max_retries = 20
+        
+        failure_result = {
+            "generation": "",
+            "evaluation": {
+                "meets_instruction": "no",
+                "major_conflicts": 0,
+                "minor_conflicts": 0,
+                "omissions": 0,
+                "raw_score": 0.0,
+                "reason": "Pipeline failed after 20 attempts."
+            },
+            "reflection": "<#Think> The process encountered repeated errors and could not complete.<#Failed>"
+        }
+
+        generation_result = None
+        for attempt in range(max_retries):
+            try:
+                generation_result = self.generate_descriptions(
+                    source_image=source_image, instruction=original_instruction
+                )
+                break
+            except Exception as e:
+                print(f"❌ 描述生成步骤出错 (第 {attempt + 1}/{max_retries} 次): {e}")
+        
+        if generation_result is None:
+            return failure_result
+
+        evaluation_result = None
+        for attempt in range(max_retries):
+            try:
+                evaluation_result = self.evaluate_consistency(
+                    target_image=edited_image,
+                    instruction=original_instruction,
+                    description=generation_result,
+                )
+                break
+            except Exception as e:
+                print(f"❌ 评估步骤出错 (第 {attempt + 1}/{max_retries} 次): {e}")
+
+        if evaluation_result is None:
+            return failure_result
+
+        reflection_result = None
+        for attempt in range(max_retries):
+            try:
+                reflection_result = self.generate_reflection(
+                    source_image=source_image,
+                    edited_image=edited_image,
+                    instruction=original_instruction,
+                    evaluation_result=evaluation_result,
+                )
+                break
+            except Exception as e:
+                print(f"❌ 反思步骤出错 (第 {attempt + 1}/{max_retries} 次): {e}")
+
+        if reflection_result is None:
+            return failure_result
+
+        return {
+            "generation": generation_result, 
+            "evaluation": evaluation_result, 
+            "reflection": reflection_result
+        }
+
+    def evaluate_consistency(self, target_image, instruction: str, description: str) -> dict[str, Any]:
+        img_data_url = image_to_data_url(target_image)
+        messages = self._build_scoring_messages(img_data_url, description=description, instruction=instruction)
+        resp_text = self.client.call_model(messages, max_tokens=1024)
+
+        if resp_text.startswith("错误:"):
+            raise RuntimeError(f"API call failed: {resp_text}")
+
+        obj = self._parse_json_block(resp_text)
+        if obj is None:
+            raise ValueError(f"无法从API响应中解析JSON: {resp_text[:200]}...")
+
+        final_result = self._apply_score_caps_and_finalize(obj)
+        if final_result is None:
+            raise ValueError(f"结构化字段缺失或异常，无法后处理: {obj}")
+
+        return final_result
+
+    def generate_descriptions(self, source_image, instruction: str, language_type=None):
+        src_data_url = image_to_data_url(source_image)
+        messages = self.build_descriptions_messages(src_data_url, instruction, language_type)
+        resp_text = self.client.call_model(messages, max_tokens=768)
+
+        if resp_text.startswith("错误:"):
+            raise RuntimeError(f"API call failed: {resp_text}")
+
+        return resp_text.strip()
+
+    def generate_reflection(
+        self, source_image, edited_image, instruction: str, evaluation_result: dict[str, Any]
+    ) -> str:
+        src_data_url = image_to_data_url(source_image)
+        tgt_data_url = image_to_data_url(edited_image)
+
+        prior_score = evaluation_result.get("score", evaluation_result.get("raw_score", "N/A"))
+        prior_reason = evaluation_result.get("reason", "无")
+
+        messages = self._build_reflection_messages(
+            src_img_data_url=src_data_url,
+            tgt_img_data_url=tgt_data_url,
+            instruction_cn=instruction,
+            prior_score=prior_score,
+            prior_reason=prior_reason,
+        )
+
+        resp_text = self.client.call_model(messages, max_tokens=768)
+
+        is_valid, cleaned_text = self._validate_reflection_response(resp_text)
+        if not is_valid:
+            raise ValueError(f"反思结果格式无效: {cleaned_text}")
+
+        return cleaned_text
+
+
+    def _parse_json_block(self, content: str) -> dict[str, Any] | None:
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+    def build_reformt_prompt(self, source_image_data_url: str, original_instruction: str) -> list[dict]:
+        language_type = analyze_text(original_instruction)
+        system_prompt = (
+            "You are an Edit Task Instruction Rewriter. Your role is to maintain the original meaning while transforming vague, colloquial, or imprecise instructions into clear, standardized, and actionable ones. If the instructions are already sufficiently clear, they should be returned without modification."
+        )
+        user_text = f'''You are an 'editing task instruction rewriter'. Your task is:
+While keeping the meaning completely unchanged, convert the user's vague, colloquial, or informal editing instruction into a clear, standard, and actionable instruction.
+When the user's input contains complex meanings, break it down into two to three simple, clear editing instructions. Ensure these instructions do not conflict with each other and retain only the meaningful ones. Output only the rewritten content.
+The final editing instruction should preferably contain only one editing action. If the meaning is too complex to be described with a single action, the total number of actions must not exceed three.
+If the input includes explicit text modifications, enclose the text to be changed in double quotes.
+Editing types mainly include: object addition, object replacement, object deletion, color modification, background replacement, style change, material change, and text replacement.
+Where possible, the final instruction should include the editing location, the action (see the editing types), and the object being edited. Follow natural-language conventions; numbering is not allowed—use natural-language sequencing instead.
+If the user's input requires understanding and reasoning, think about where the final image will change based on the user's description, rather than returning a result prior to such reasoning.
+Rewrite in the style of the following examples.
+Example 1: User input: 'Symptoms of potassium deficiency in leaves' → Rewritten: 'Leaves turn yellow, and the tips dry out.'
+Example 2: User input: 'Make the bread look over-fried' → Rewritten: 'Change the bread’s color to a dark, toasted brown.'
+Example 3: User input: 'Photoshop me a boyfriend; make it a two-person photo' → Rewritten: 'Add a man next to the woman.'
+Example 4: User input: 'Improve this image, remove the distant power lines, keep a realistic style' → Rewritten: 'Remove the power lines.'
+Example 5: User input: 'Change “TOFEL” in the image to “IELTS”' → Rewritten: 'Replace the text "TOFEL" with "IELTS".'
+Example 6: User input: 'Make it an ID photo.' → Rewritten: 'Replace the background with white.'
+Example 7: User input: 'Change the tie to black.' → Rewritten: 'Change the tie color to black.'
+Example 8: User input: 'Remove the watermark in the bottom-right corner.' → Rewritten: 'Remove the bottom-right watermark.'
+Example 9: User input: 'Increase hair volume. Change the hairstyle to long hair. Make the person look gentler.' → Rewritten: 'Increase the amount of hair to make the person look gentler.'
+User input instruction:{original_instruction}
+Your returned instruction must be in {language_type}. Your returned instruction must be in {language_type}. Your returned instruction must be in {language_type}.
+The returned instruction is:'''
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": source_image_data_url}},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+
+    def build_descriptions_messages(self, source_image_data_url: str, instruction_cn: str, language_type=None):
+        # system_prompt = (
+        #     "You are a precise visual-to-text describer. "
+        #     "Your goal is to produce a concise, factual Chinese description of the **final target image** "
+        #     "that would be obtained after applying the edit instruction to the input image. "
+        #     "Only describe what is explicitly visible in the final target image."
+        # )
+        language_type = analyze_text(instruction_cn)
+
+        system_prompt = (
+            "You are a precise visual-to-text describer. "
+            f"Your goal is to produce a concise, factual {language_type} description of the **final target image** "
+            "that would be obtained after applying the edit instruction to the input image. "
+            "Only describe what is explicitly visible in the final target image."
+        )
+
+        user_text = (
+            f"You will see an input image and an editing instruction. Please generate a {language_type} description of the **target image**, strictly following these principles:\n"
+            "1. **Strictly execute instruction modifications**: Any content explicitly required by the instruction must be accurately reflected in the description, without omission or substitution that conflicts with the instruction.\n"
+            "2. **Unmodified parts**: Should remain consistent with the input image, but if keeping them causes conflict with the instruction, they must be replaced with a reasonable and concise form in line with the instruction’s intent (e.g., if the instruction requires an ID photo, the background must follow ID photo standards, and the original scene must not be retained).\n"
+            "3. **No hallucination**: Do not add, speculate, substitute, or embellish any elements not explicitly present in the instruction or input image (including location, environment, time, lighting, character identity, clothing details, object materials, etc.).\n"
+            f"4. **Keep it concise**: Provide one clear {language_type} description of the target image, accurately conveying the key visible people, objects, poses, background, and colors; avoid phrases like “original image,” “remains unchanged,” or “required by the instruction.”\n"
+            "5. **Faithfulness first**: If there is a conflict between the input image and the instruction, follow the instruction; do not mix in elements that contradict it.\n\n"
+            f"Editing Instruction: {instruction_cn}\n"
+            "Please directly provide the description of the target image:"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": source_image_data_url}},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+
+    def _build_scoring_messages(self, img_data_url: str, description: str, instruction: str) -> list[dict]:
+        sys_prompt = "You are a strict image-text consistency evaluator, and you should only output strict JSON."
+        language_type = analyze_text(instruction)
+        user_prompt = f'''Under the premise of satisfying the [editing instruction], evaluate the consistency between the [image] and the [text description].
+            Please output only one JSON object containing the following keys:
+            - meets_instruction: "yes" | "partial" | "no"
+            - major_conflicts: Non-negative integer
+            - minor_conflicts: Non-negative integer
+            - omissions:       Non-negative integer
+            - raw_score:       Floating-point number from 0 to 10
+            - reason:          Brief reasoning in {language_type}: first state whether the instruction is satisfied, then point out the main consistencies/inconsistencies.
+            Judgment points:
+            1) Instruction satisfaction takes priority;
+            2) Obvious contradictions count as major_conflicts; minor discrepancies count as minor_conflicts;
+            3) If the description omits key elements present in the image, count them as omissions;
+            4) raw_score should follow the 0..10 scale, but do not include any extra text.
+
+            [Editing Instruction]
+            {instruction}
+
+            [Text Description]
+            {description}
+            '''
+        return [
+            {"role": "system", "content": sys_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": img_data_url}},
+                ],
+            },
+        ]
+
+    def _apply_score_caps_and_finalize(self, obj: dict[str, Any]) -> dict[str, Any] | None:  # noqa: C901
+        try:
+            mi = str(obj.get("meets_instruction", "")).strip().lower()
+            major = int(obj.get("major_conflicts", 0) or 0)
+            minor = int(obj.get("minor_conflicts", 0) or 0)
+            hallu = int(obj.get("hallucinations", 0) or 0)
+            omit = int(obj.get("omissions", 0) or 0)
+            raw = float(obj.get("raw_score", 0))
+            reason = str(obj.get("reason", "")).strip()
+            # 原始分裁剪到 0..10
+            if 0 <= raw <= 1.0000001:
+                raw *= 10.0
+            raw = max(0.0, min(10.0, raw))
+            cap = 10.0
+            cap_trace: list[str] = []
+            # 指令满足度封顶
+            if mi == "no":
+                cap = min(cap, 2.0)
+                cap_trace.append("cap<=2: 未满足指令关键要求")
+            elif mi == "partial":
+                cap = min(cap, 5.0)
+                cap_trace.append("cap<=5: 仅部分满足指令")
+            # 冲突封顶
+            if major >= 2:
+                cap = min(cap, 5.0)
+                cap_trace.append("cap<=5: 多个明显矛盾")
+            elif major == 1:
+                cap = min(cap, 8.0)
+                cap_trace.append("cap<=8: 存在1个明显矛盾")
+            # 幻觉/遗漏封顶
+            if hallu > 0 or omit > 0:
+                cap = min(cap, 7.0)
+                why = []
+                if hallu > 0:
+                    why.append(f"幻觉x{hallu}")
+                if omit > 0:
+                    why.append(f"遗漏x{omit}")
+                cap_trace.append(f"cap<=7: {', '.join(why)}")
+            # 存在明显差异不允许≥9（当 major>0 或 mi!='yes'）
+            if mi != "yes" or major > 0 or hallu > 0 or omit > 0:
+                cap = min(cap, 8.99)
+                cap_trace.append("cap<9: 存在明显差异/问题")
+            final_score = min(raw, cap)
+            return {
+                "score": float(f"{final_score:.4f}"),
+                "raw_score": raw,
+                "cap_trace": cap_trace,
+                "meets_instruction": mi,
+                "major_conflicts": major,
+                "minor_conflicts": minor,
+                "hallucinations": hallu,
+                "omissions": omit,
+                "reason": reason,
+            }
+        except Exception:
+            return None
+
+    def _build_reflection_messages(
+        self, src_img_data_url: str, tgt_img_data_url: str, instruction_cn: str, prior_score: Any, prior_reason: str
+    ) -> list[dict[str, Any]]:
+        prior_text = f'''
+        The first image is the input; the second image is the result after applying the image "edit instruction".
+        The current edit instruction is: 
+            {instruction_cn}
+            I hope you can determine, based on the content of the second image and the editing instruction, whether the edited result meets the requirements, and return strictly in one of the following formats:
+        ```
+        <#Think> ...
+        <#Reflection> ...
+        ```
+        or
+        ```
+        <#Think> ...
+        <#Failed>
+        ```
+        or
+        ```
+        <#Think> ...
+        <#Success>
+        ```
+        After <#Think>, include the reasoning process; if <#Reflection> appears, it means the image did not fully follow the instruction and further modification is needed—append a "secondary editing instruction" after <#Reflection>; if <#Failed> appears, it is impossible to further modify the current result to meet the instruction; if <#Success> appears, the editing is successful.
+        Now check the image and the instruction using the following criteria:
+        1. Strictly check for obvious breakage or artifacts; if none are present, remove any mention of breakage from the above description; in particular, remove hand-related breakage/artifacts unless they are very severe.
+        2. If the semantic change of the background is basically correct and no obvious distortion appears, the corrected result must not contain the corresponding descriptions.
+        3. Ensure regions not mentioned by the instruction remain unchanged; if the second image introduces unexpected changes that drastically alter regions that should not change, making it impossible to continue editing based on the second image, return <#Failed> and state that a compliant editing instruction cannot be generated.
+        4. Ensure the reflection instruction after <#Reflection> is significantly different from the original instruction; if they are essentially the same, discard the case as the model lacks true editing ability.
+        5. Ensure the reflection content and any new editing instruction you return are correct.
+        6. <#Reflection> and <#Failed> may appear only once and must come after <#Think>.
+        7. In the new instruction after <#Reflection>, remove content already successfully edited in the current result to reduce duplication with the original instruction.
+        Emphasis: the instruction after <#Reflection> must be based on the second image and must not rely on information from the first image.
+        Then:
+        1. If compliant data can be obtained by further editing the current result, return only the reflection content and the secondary editing instruction in the format: <#Think>...<#Reflection>..., and nothing else.
+        2. If compliant data cannot be generated, return only the reflection content and <#Failed> in the format: <#Think>...<#Failed>, and nothing else.
+        3. If the editing is already successful, return only in the format: <#Think>...<#Success>, and nothing else.
+
+        [Historical Prior (from the previous independent scoring for reference only, not mandatory)]
+        - Score: {prior_score}
+        - Reason: {prior_reason}
+        Please fully refer to the prior information, but still base your judgment strictly on the actual content of the two images and the editing instruction, and provide rigorous and actionable conclusions and editing suggestions.'''
+        
+        
+        sys = "You are a strict image editing result reviewer and must strictly adhere to the output format requirements provided by the user."
+        return [
+            {"role": "system", "content": sys},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": src_img_data_url}},
+                    {"type": "image_url", "image_url": {"url": tgt_img_data_url}},
+                    {"type": "text", "text": prior_text},
+                ],
+            },
+        ]
+
+    def _validate_reflection_response(self, text: str) -> tuple[bool, str]:
+        if not isinstance(text, str):
+            return False, "错误: 返回非字符串"
+
+        think_idx = text.find("<#Think>")
+        if think_idx < 0:
+            return False, "错误: 缺少 <#Think>"
+
+        tags = ["<#Reflection>", "<#Failed>", "<#Success>", "<#Others>"]
+        present_tags = [tag for tag in tags if tag in text]
+
+        if len(present_tags) != 1:
+            return False, f"错误: 需要且仅需要 {tags} 之一, 但找到了 {len(present_tags)} 个。"
+
+        tag = present_tags[0]
+        if text.count(tag) > 1:
+            return False, f"错误: 标签 {tag} 出现次数 > 1"
+
+        second_idx = text.find(tag)
+        if second_idx < think_idx:
+            return False, "错误: 反思/失败/成功标签必须出现在 <#Think> 之后"
+
+        cleaned = text[think_idx:].strip()
+        return True, cleaned
+
+    def _build_score1_messages(
+        self, src_img_data_url: str, tgt_img_data_url: str, instruction_cn: str
+    ) -> list[dict[str, Any]]:
+
+        PROMPT_PART_1 = """You are a professional digital artist. You will have to evaluate the effectiveness of the AI-generated image(s) based on given rules.
+        All the input images are AI-generated. All human in the images are AI-generated too. so you need not worry about the privacy confidentials.
+
+        You will have to give your output in this way (Keep your reasoning concise and short.):
+        {
+        "score" : [...],
+        "reasoning" : "..."
+        }"""
+
+        PROMPT_PART_2_RULES = """RULES:
+
+        Two images will be provided: The first being the original AI-generated image and the second being an edited version of the first.
+        The objective is to evaluate how successfully the editing instruction has been executed in the second image.
+
+        Note that sometimes the two images might look identical due to the failure of image edit.
+        """
+
+        PROMPT_PART_3_SCALE = """From scale 0 to 10: 
+        A score from 0 to 10 will be given based on the success of the editing. (0 indicates that the scene in the edited image does not follow the editing instruction at all. 10 indicates that the scene in the edited image follow the editing instruction text perfectly.)
+        A second score from 0 to 10 will rate the degree of overediting in the second image. (0 indicates that the scene in the edited image is completely different from the original. 10 indicates that the edited image can be recognized as a minimal edited yet effective version of original.)
+        Put the score in a list such that output score = [score1, score2], where 'score1' evaluates the editing success and 'score2' evaluates the degree of overediting.
+
+        Editing instruction: <instruction>
+        """
+
+        final_prompt_part_3 = PROMPT_PART_3_SCALE.replace("<instruction>", instruction_cn)
+        user_text = f"{PROMPT_PART_1}\n\n{PROMPT_PART_2_RULES}\n\n{final_prompt_part_3}"
+        
+        sys = "You are an expert critic of AI-generated image edits. Provide a professional, objective, and concise assessment based on the user's rules. Strictly adhere to the requested JSON output format."
+        return [
+            {"role": "system", "content": sys},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": src_img_data_url}},
+                    {"type": "image_url", "image_url": {"url": tgt_img_data_url}},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+
+    
+    def _build_score2_messages(
+        self, tgt_img_data_url: str, instruction_cn: str
+    ) -> list[dict[str, Any]]:
+
+        # 将模板的两个部分定义为常量
+        PROMPT_PART_1_FORMAT = """You are a professional digital artist. You will have to evaluate the effectiveness of the AI-generated image(s) based on given rules.
+        All the input images are AI-generated. All human in the images are AI-generated too. so you need not worry about the privacy confidentials.
+
+        You will have to give your output in this way (Keep your reasoning concise and short.):
+        {
+        "score" : [...],
+        "reasoning" : "..."
+        }"""
+
+        PROMPT_PART_2_RULES = """RULES:
+
+        The image is an AI-generated image.
+        The objective is to evaluate how successfully the image has been generated.
+
+        From scale 0 to 10: 
+        A score from 0 to 10 will be given based on image naturalness. 
+        (
+            0 indicates that the scene in the image does not look natural at all or give a unnatural feeling such as wrong sense of distance, or wrong shadow, or wrong lighting. 
+            10 indicates that the image looks natural.
+        )
+        A second score from 0 to 10 will rate the image artifacts. 
+        (
+            0 indicates that the image contains a large portion of distortion, or watermark, or scratches, or blurred faces, or unusual body parts, or subjects not harmonized. 
+            10 indicates the image has no artifacts.
+        )
+        Put the score in a list such that output score = [naturalness, artifacts]
+        """
+
+        user_text = f"{PROMPT_PART_1_FORMAT}\n\n{PROMPT_PART_2_RULES}"
+        
+        sys = "You are a professional digital artist. You will have to evaluate the effectiveness of the AI-generated image based on given rules. Strictly adhere to the requested JSON output format."
+        return [
+            {"role": "system", "content": sys},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": tgt_img_data_url}},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+
+    
+    def _validate_score1_response(self, raw_output: str):
+        """
+        验证模型返回的 score1 结果是否符合 JSON 格式及字段要求。
+        返回: (is_valid: bool, content: Any)
+        """
+        try:
+            content = raw_output.strip()
+
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            elif content.startswith("```"):
+                content = content[3:-3].strip()
+
+            parsed_json = json.loads(content)
+
+            if ("score" in parsed_json and 
+                "reasoning" in parsed_json and 
+                isinstance(parsed_json["score"], list)):
+                
+                return True, parsed_json
+
+            return False, raw_output
+
+        except (json.JSONDecodeError, Exception):
+            return False, raw_output
+
+    def generate_score1(
+        self, source_image, edited_image, instruction: str
+    ) -> str:
+        src_data_url = image_to_data_url(source_image)
+        tgt_data_url = image_to_data_url(edited_image)
+
+        messages = self._build_score1_messages(
+            src_img_data_url=src_data_url,
+            tgt_img_data_url=tgt_data_url,
+            instruction_cn=instruction
+        )
+        resp_text = self.client.call_model(messages, max_tokens=768)
+
+        is_valid, cleaned_text = self._validate_score1_response(resp_text)
+        if not is_valid:
+            raise ValueError(f"反思结果格式无效: {cleaned_text}")
+
+        return cleaned_text
+    
+
+
+    def generate_score2(
+        self, edited_image, instruction: str
+    ) -> str:
+        tgt_data_url = image_to_data_url(edited_image)
+
+        messages = self._build_score2_messages(
+            tgt_img_data_url=tgt_data_url,
+            instruction_cn=instruction
+        )
+        
+
+        resp_text = self.client.call_model(messages, max_tokens=768)
+
+        is_valid, cleaned_text = self._validate_score1_response(resp_text)
+        if not is_valid:
+            raise ValueError(f"反思结果格式无效: {cleaned_text}")
+
+        return cleaned_text
+
+
+
+    def run_best_pipeline(self, source_image, edited_image, original_instruction: str) -> dict[str, Any]:
+        max_retries = 20
+        
+        score1 = None
+        for attempt in range(max_retries):
+            try:
+                score1 = self.generate_score1(
+                    source_image=source_image, edited_image=edited_image, instruction=original_instruction
+                )
+                break  
+            except Exception as e:
+                print(f"❌ score1评估步骤出错 (第 {attempt + 1}/{max_retries} 次): {e}")
+        
+        if score1 is None:
+            score1 = {
+                "score": [0, 0],
+                "reasoning": "score1 evaluation failed after 20 attempts."
+            }
+
+        score2 = None
+        for attempt in range(max_retries):
+            try:
+                score2 = self.generate_score2(
+                    edited_image=edited_image,
+                    instruction=original_instruction
+                )
+                break  
+            except Exception as e:
+                print(f"❌ score2评估步骤出错 (第 {attempt + 1}/{max_retries} 次): {e}")
+
+        if score2 is None:
+            score2 = {
+                "score": [0, 0],
+                "reasoning": "score2 evaluation failed after 20 attempts."
+            }
+
+        return {"score1": score1, "score2": score2}
+
+
+
+
+
 class Step1XEditThinker:
     def __init__(self, model, processor):
-        self.reflector = ImageEditEvaluator(model=model, processor=processor)
+        self.reflector = ImageEditEvaluator_EN(model=model, processor=processor)
 
     def reflect(
         self,
@@ -510,7 +1115,10 @@ class Step1XEditThinker:
         res = self.reflector.run_full_pipeline(
             source_image=source_image, edited_image=result_image, original_instruction=instruction
         )
-        return res["reflection"]
+        res2 = self.reflector.run_best_pipeline(
+            source_image=source_image, edited_image=result_image, original_instruction=instruction
+        )
+        return res["reflection"], res2
 
     def think(self, source_image: Image.Image, instruction: str):
         res = self.reflector.prompt_reformat(source_image=source_image, original_instruction=instruction)

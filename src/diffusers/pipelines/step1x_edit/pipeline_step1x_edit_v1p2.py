@@ -323,6 +323,8 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         self.QWEN25VL_PREFIX = EDIT_PREFIX
         self.QWEN25VL_PREFIX_LEN = 90
 
+        # print(self.processor.tokenizer.name_or_path)
+
         self.processor = AutoProcessor.from_pretrained(
             self.processor.tokenizer.name_or_path,
             min_pixels=256 * 28 * 28,
@@ -1060,6 +1062,7 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
         success = False
 
         if enable_reflection_mode or enable_thinking_mode:
+            # print(self.text_encoder, self.processor)
             thinker = Step1XEditThinker(self.text_encoder, self.processor)
             if enable_thinking_mode:
                 reformat_prompt = thinker.think(image, prompt)
@@ -1068,6 +1071,7 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
             prompt = reformat_prompt
             out_images = []
             out_think_info = []
+            best_think_info = []
         else:
             max_try_cnt = 1
             out_images = None
@@ -1299,10 +1303,11 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 image = self._output_process_image(image, img_info)
 
             if enable_reflection_mode:
-                thinking_info = thinker.reflect(original_ref_image, image[0], original_prompt)
+                thinking_info, best_info = thinker.reflect(original_ref_image, image[0], original_prompt)
                 success, refine_prompt = thinker.format_text(thinking_info)
                 out_images.append(image[0])
                 out_think_info.append(thinking_info)
+                best_think_info.append(best_info)
                 if not success:
                     if refine_prompt is not None:  # type: ignore
                         prompt = refine_prompt
@@ -1316,15 +1321,59 @@ class Step1XEditPipelineV1P2(DiffusionPipeline):
                 break
         # Offload all models
         self.maybe_free_model_hooks()
+
+        final_images = [out_images[0]] if out_images else []
+
         if enable_reflection_mode or enable_thinking_mode:
+
+            if best_think_info and len(best_think_info) > 0 and len(out_images) > 0:
+                best_idx = 0
+                max_score = -1
+                best_has_success = False
+
+                for i, info in enumerate(best_think_info):
+                    s1_min = min(info['score1']['score'])
+                    s2_min = min(info['score2']['score'])
+                    current_score = s1_min * s2_min
+
+                    current_think_str = out_think_info[i] if i < len(out_think_info) else ""
+                    current_has_success = "<#Success>" in current_think_str
+
+                    if current_score > max_score:
+                        best_idx = i
+                        max_score = current_score
+                        best_has_success = current_has_success
+                
+                    elif current_score == max_score:
+                        if current_has_success and not best_has_success:
+                            best_idx = i
+                            best_has_success = True
+                        
+                        elif current_has_success == best_has_success:
+                            best_idx = i
+
+                final_images = [out_images[best_idx]]
+
             if enable_thinking_mode:
-                return Step1XEditPipelineOutput(images=out_images, reformat_prompt=reformat_prompt, think_info=out_think_info)
+                return Step1XEditPipelineOutput(
+                    images=out_images, 
+                    reformat_prompt=reformat_prompt, 
+                    think_info=out_think_info, 
+                    best_info=best_think_info,
+                    final_images=final_images
+                )
             else:
-                return Step1XEditPipelineOutput(images=out_images, think_info=out_think_info)
+                return Step1XEditPipelineOutput(
+                    images=out_images, 
+                    think_info=out_think_info, 
+                    best_info=best_think_info,
+                    final_images=final_images
+                )
+
         else:
             if not return_dict:
                 return (image,)
 
-            return Step1XEditPipelineOutput(images=out_images)
+            return Step1XEditPipelineOutput(images=out_images, final_images=final_images)
 
     
